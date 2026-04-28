@@ -226,6 +226,139 @@ Additional observations:
 
 The main takeaway is that summary compression creates a real quality gap, but on-demand retrieval recovers a meaningful portion of it while preserving large token savings.
 
+### 3.6 Tool Trace Analysis
+
+The QMSum `summary_ondemand` results also preserve tool traces, which make it possible to inspect whether the model answered directly or first retrieved hidden history and loaded local context. The traces are stored under `summary_ondemand.tool_traces` in the raw results. Each trace entry contains the tool name, arguments, and response; the per-case logs expose the same information under `ToolTrace`.
+
+Based on `qmsum_all_specific_hidden_full/results.json`, 154 of 189 cases invoked at least one retrieval tool, while 35 cases did not invoke any tool. Every traced case starts with `session_search`. There are no cases where the first tool is `session_load`, and no cases where the model calls `session_load` without a preceding `session_search`. The dominant path is:
+
+```
+Query
+  |
+  v
+summary_ondemand
+  |
+  v
+session_search(
+  query=<derived from user question>,
+  scope=current_hidden
+)
+  |
+  |  returns candidate event_id + snippets
+  v
+session_load(
+  session_id=summary_ondemand-<case_id>,
+  event_id=<uuid from search result>,
+  before=1,
+  after=1
+)
+  |
+  |  returns local hidden-history messages
+  v
+Final answer with recovered evidence
+```
+
+This path appears 123 times, covering 65.1% of all 189 cases and 79.9% of traced cases. In other words, the main on-demand retrieval flow behaves as intended: the model first uses `session_search` over `current_hidden` to locate candidate historical events, then uses the returned `event_id` with `session_load` to recover the surrounding local context.
+
+The aggregate call pattern is:
+
+| Metric                              | Value |
+| ----------------------------------- | ----: |
+| Total cases                         |   189 |
+| Cases with tool traces              |   154 |
+| Cases without tool traces           |    35 |
+| Cases with at least one `session_load` |   142 |
+| Cases with only `session_search`    |    12 |
+| Direct load without search          |     0 |
+| Total `session_search` calls        |   200 |
+| Total `session_load` calls          |   166 |
+
+Tool use is strongly associated with quality recovery. Cases with tool calls have an average ROUGE-L gain of `+0.0315`, while cases without tool calls are nearly flat (`-0.0010`). Splitting the traced cases further, cases that complete `search -> load` gain `+0.0353` on average, while search-only cases average `-0.0135`. This indicates that most of the recovery comes from loading localized evidence after search; search alone is not enough to reliably improve the answer.
+
+Two examples illustrate the pattern. In `Bed003_specific_01`, the query asks: "What did Grad B say about the structure of the belief net?" Plain `summary` answers that the transcript contains no relevant information and gets ROUGE-L `0.1481`. `summary_ondemand` first calls `session_search` with `Grad B structure of the belief net`; the returned candidates include `event_id=4bcef10f-33a4-4ae9-9178-70c459704c2f`, pointing to the discussion around Turn 989 about the evolving Bayes-net structure. The model then calls `session_load` around that event and answers that Grad B mentioned the evolving Bayes-net structure would affect the ideal task. ROUGE-L rises modestly to `0.1538`. This is the simplest successful shape: one search locates the anchor, and one load restores the missing local evidence.
+
+```
+question: Grad B + structure of the belief net
+  |
+  v
+session_search(
+  query="Grad B structure of the belief net",
+  scope=current_hidden
+)
+  |
+  |  top hit: event_id=4bcef10f-33a4-4ae9-9178-70c459704c2f
+  |           snippet around Turn 989, "evolving Bayes-net"
+  v
+session_load(
+  session_id=summary_ondemand-Bed003_specific_01,
+  event_id=4bcef10f-33a4-4ae9-9178-70c459704c2f,
+  before=1,
+  after=1
+)
+  |
+  |  loads Turns 988-990
+  v
+answer: evolving Bayes-net structure affects the ideal task
+```
+
+`covid_4_specific_01` shows a more complex multi-evidence path. The query asks about petitions fraudulence, tax evasion, violence handling, and supervision. The model first searches the full query, then decomposes it into subqueries such as `petitions fraudulence`, `tax evasion`, `violence handling`, and `supervisory`. The trace contains 5 `session_search` calls and 3 `session_load` calls: `tax evasion` finds the Turn 127 discussion about conditions on the Large Employer Emergency Financing Facility, `violence handling` finds the Turn 65 answer about gun violence, and `supervisory` returns no result. The final `summary_ondemand` answer improves ROUGE-L from plain summary's `0.1101` to `0.1922`, even above long context's `0.1640`. This example shows the multi-topic form of on-demand retrieval: repeated searches identify several evidence anchors, and loads bring the key local snippets back into context.
+
+```
+compound question
+  |
+  +--> search(query="petitions fraudulence, tax evasion, violence handling, supervisory",
+  |           scope=current_hidden)
+  |
+  +--> search(query="petitions fraudulence", scope=current_hidden)
+  |       |
+  |       +--> hit around Turn 001
+  |
+  +--> search(query="tax evasion", scope=current_hidden)
+  |       |
+  |       +--> hit around Turn 127
+  |             |
+  |             v
+  |           load(session_id=summary_ondemand-covid_4_specific_01,
+  |                event_id=<Turn 127 hit uuid>, before=1, after=1)
+  |
+  +--> search(query="violence handling", scope=current_hidden)
+  |       |
+  |       +--> hit around Turn 065
+  |             |
+  |             v
+  |           load(session_id=summary_ondemand-covid_4_specific_01,
+  |                event_id=<Turn 065 hit uuid>, before=1, after=1)
+  |
+  +--> search(query="supervisory", scope=current_hidden) ---> no result
+  |
+  v
+final answer combines tax-evasion and gun-violence evidence
+```
+
+The Committee subset follows the same pattern. In `qmsum_committee_specific_hidden_full/results.json`, 26 of 43 cases have tool traces, all traced cases start with `session_search`, and 25 cases call at least one `session_load`. The most common path is still `session_search -> session_load`, and this subset has no `anchor event not found` errors.
+
+One caveat is that the full hidden-detail run has 4 cases where `session_load` returns `anchor event not found`. In those cases, the model appears to pass a transcript turn number instead of an `event_id` returned by `session_search`. This does not change the main conclusion, but it points to a concrete protocol improvement: prompts should state more explicitly that `session_load` must use an `event_id` from the search response, and the tool layer could add friendlier validation or correction for this failure mode.
+
+The failure shape is:
+
+```
+session_search(...)
+  |
+  |  response contains event_id=<uuid> and transcript Turn N
+  v
+model passes Turn N as event_id to session_load(
+  session_id=summary_ondemand-<case_id>,
+  event_id=<Turn N>,
+  before=1,
+  after=1
+)
+  |
+  v
+session_load -> anchor event not found
+```
+
+So the next optimization target is not the overall retrieval flow, but reducing parameter misuse between the search result and the load call.
+
 ---
 
 ## 4. Analysis
