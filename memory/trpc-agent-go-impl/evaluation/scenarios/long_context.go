@@ -31,6 +31,8 @@ const (
 	ScenarioSessionRecall ScenarioType = "session_recall"
 	ScenarioAgentic       ScenarioType = "agentic"
 	ScenarioAuto          ScenarioType = "auto"
+	ScenarioGraphBaseline ScenarioType = "graph_baseline"
+	ScenarioGraphMR       ScenarioType = "graph_mr"
 )
 
 // Config holds scenario evaluation configuration.

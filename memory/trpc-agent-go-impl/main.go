@@ -35,13 +35,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go-benchmark/memory/trpc-agent-go-impl/evaluation/dataset"
 	"trpc.group/trpc-go/trpc-agent-go-benchmark/memory/trpc-agent-go-impl/evaluation/metrics"
 	"trpc.group/trpc-go/trpc-agent-go-benchmark/memory/trpc-agent-go-impl/evaluation/scenarios"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
@@ -56,17 +59,18 @@ import (
 
 // Command-line flags.
 var (
-	flagModel     = flag.String("model", "", "Model name (env MODEL_NAME or gpt-4o-mini)")
-	flagEvalModel = flag.String("eval-model", "", "Evaluation model for LLM judge")
-	flagDataset   = flag.String("dataset", "../data", "Dataset directory")
-	flagDataFile  = flag.String("data-file", "locomo10.json", "Dataset file name")
-	flagOutput    = flag.String("output", "../results", "Output directory")
+	flagModel         = flag.String("model", "", "Model name (env MODEL_NAME or gpt-4o-mini)")
+	flagEvalModel     = flag.String("eval-model", "", "Evaluation model for LLM judge")
+	flagDataset       = flag.String("dataset", "../data", "Dataset directory")
+	flagDataFile      = flag.String("data-file", "locomo10.json", "Dataset file name")
+	flagDatasetFormat = flag.String("dataset-format", "locomo", "Dataset format: locomo or longmemeval")
+	flagOutput        = flag.String("output", "../results", "Output directory")
 
 	flagScenario = flag.String(
 		"scenario",
 		"long_context",
 		"Evaluation scenario (comma-separated): "+
-			"long_context, session_recall, agentic, auto, all",
+			"long_context, session_recall, agentic, auto, graph_baseline, graph_mr, all",
 	)
 	// Memory backend flags (comma-separated for multiple).
 	flagMemoryBackends = flag.String(
@@ -117,8 +121,30 @@ var (
 		"Number of memory_search calls per QA "+
 			"(1=single search, auto/agentic only)",
 	)
-	flagLLMJudge = flag.Bool("llm-judge", false, "Enable LLM-as-Judge evaluation")
-	flagVerbose  = flag.Bool("verbose", false, "Verbose output")
+	flagLLMJudge             = flag.Bool("llm-judge", false, "Enable LLM-as-Judge evaluation")
+	flagVerbose              = flag.Bool("verbose", false, "Verbose output")
+	flagLMEQuestionTypes     = flag.String("lme-question-types", "", "LongMemEval question types (comma-separated)")
+	flagLMEManifest          = flag.String("lme-manifest", "", "LongMemEval fixed case-id manifest path")
+	flagLMEMaxRetries        = flag.Int("lme-max-retries", lmeDefaultMaxRetries, "LongMemEval transport retry count")
+	flagLMEAnswerMaxTokens   = flag.Int("lme-answer-max-tokens", lmeDefaultAnswerMaxTokens, "LongMemEval answer max tokens")
+	flagLMEJudgeMaxTokens    = flag.Int("lme-judge-max-tokens", lmeDefaultJudgeMaxTokens, "LongMemEval judge max tokens")
+	flagLMEExtractionWait    = flag.Duration("lme-extraction-wait", 10*time.Minute, "LongMemEval auto extraction wait timeout")
+	flagLMEEmbeddingCache    = flag.Bool("lme-embedding-cache", true, "Enable persistent embedding cache for LongMemEval")
+	flagLMEEmbeddingCacheDir = flag.String(
+		"lme-embedding-cache-dir",
+		"",
+		"LongMemEval embedding cache directory (default: <output>/longmemeval/.cache)",
+	)
+	flagLMESessionRecallUserOnly = flag.Bool(
+		"lme-session-recall-user-only",
+		true,
+		"Index only user turns for LongMemEval session_recall because retrieval is user-role only",
+	)
+	flagLMEGraphMRMemoryBackend = flag.String(
+		"lme-graph-mr-memory-backend",
+		"inmemory",
+		"Associative memory backend for LongMemEval graph_mr: inmemory or pgvector",
+	)
 	// Debug flags (auto scenario diagnosis).
 	flagDebugDumpMemories = flag.Bool("debug-dump-memories", false, "Dump extracted memories (auto scenario only)")
 	flagDebugMemLimit     = flag.Int("debug-mem-limit", 200, "Max memories to dump when debug-dump-memories is enabled")
@@ -223,6 +249,19 @@ type EvalSummary struct {
 func main() {
 	flag.Parse()
 	validateFlags()
+
+	if *flagDatasetFormat == lmeDatasetFormat {
+		ctx, stop := signal.NotifyContext(
+			context.Background(),
+			os.Interrupt,
+			syscall.SIGTERM,
+		)
+		defer stop()
+		if err := runLongMemEvalMemory(ctx); err != nil {
+			log.Fatalf("LongMemEval memory benchmark failed: %v", err)
+		}
+		return
+	}
 
 	modelName := getModelName()
 	evalModelName := getEvalModelName()
@@ -520,6 +559,9 @@ func buildScenarioDir(outputDir string, scenario scenarios.ScenarioType, backend
 }
 
 func validateFlags() {
+	if *flagDatasetFormat != "locomo" && *flagDatasetFormat != lmeDatasetFormat {
+		log.Fatalf("Invalid dataset-format: %s", *flagDatasetFormat)
+	}
 	if *flagVectorTopK < 1 {
 		log.Fatalf("Invalid vector-topk: %d", *flagVectorTopK)
 	}
@@ -537,6 +579,8 @@ func validateFlags() {
 		"session_recall": true,
 		"agentic":        true,
 		"auto":           true,
+		"graph_baseline": true,
+		"graph_mr":       true,
 		"all":            true,
 	}
 	for _, s := range strings.Split(*flagScenario, ",") {
@@ -609,7 +653,7 @@ const (
 	envOpenAIEmbeddingBaseURL = "OPENAI_EMBEDDING_BASE_URL"
 )
 
-func newEmbeddingEmbedder(modelName string) *openai.Embedder {
+func newEmbeddingEmbedder(modelName string) (embedder.Embedder, error) {
 	opts := []openai.Option{
 		openai.WithModel(modelName),
 	}
@@ -626,7 +670,53 @@ func newEmbeddingEmbedder(modelName string) *openai.Embedder {
 		opts = append(opts, openai.WithBaseURL(baseURL))
 	}
 
-	return openai.New(opts...)
+	inner := openai.New(opts...)
+	if !shouldUseLMEEmbeddingCache() {
+		return inner, nil
+	}
+	cache, err := newLMEEmbeddingCache(
+		inner,
+		modelName,
+		lmeEmbeddingCachePath(modelName),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
+func shouldUseLMEEmbeddingCache() bool {
+	return *flagDatasetFormat == lmeDatasetFormat && *flagLMEEmbeddingCache
+}
+
+func lmeEmbeddingCachePath(modelName string) string {
+	cacheDir := strings.TrimSpace(*flagLMEEmbeddingCacheDir)
+	if cacheDir == "" {
+		cacheDir = filepath.Join(*flagOutput, "longmemeval", ".cache")
+	}
+	return filepath.Join(cacheDir, fmt.Sprintf(
+		"embeddings_%s",
+		sanitizeCacheFileName(modelName),
+	))
+}
+
+func sanitizeCacheFileName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "default"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	return b.String()
 }
 
 func getPGVectorDSN() string {
@@ -712,7 +802,10 @@ func createSessionRecallService(
 		)
 	}
 	embedModelName := getEmbedModelName()
-	emb := newEmbeddingEmbedder(embedModelName)
+	emb, err := newEmbeddingEmbedder(embedModelName)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf(
 		"Creating session recall pgvector service (embed_model=%s)",
 		embedModelName,
@@ -726,6 +819,7 @@ func createSessionRecallService(
 		sessionpgvector.WithTablePrefix(
 			tableNameWithSuffix(sessionRecallTableBase),
 		),
+		sessionpgvector.WithSoftDelete(false),
 		sessionpgvector.WithSyncIndexing(true),
 	)
 }
@@ -740,7 +834,10 @@ func createPGVectorService(
 		)
 	}
 	embedModelName := getEmbedModelName()
-	emb := newEmbeddingEmbedder(embedModelName)
+	emb, err := newEmbeddingEmbedder(embedModelName)
+	if err != nil {
+		return nil, err
+	}
 	tableName := tableNameWithSuffix(pgvectorTableDefaultBase)
 	var ext extractor.MemoryExtractor
 	if opts.enableExtractor {
