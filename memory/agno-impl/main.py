@@ -34,13 +34,28 @@ from openai import OpenAI
 import dataset
 import metrics
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import lme_common
+
 # ---------------------------------------------------------------------------
 # Agno imports.
 # ---------------------------------------------------------------------------
-from agno.agent import Agent
-from agno.db.sqlite import SqliteDb
-from agno.memory.manager import MemoryManager
-from agno.models.openai import OpenAIChat
+try:
+    from agno.agent import Agent
+    from agno.db.sqlite import SqliteDb
+    from agno.memory.manager import MemoryManager
+    from agno.models.openai import OpenAIChat
+except ImportError as exc:
+    Agent = None
+    SqliteDb = None
+    MemoryManager = None
+    OpenAIChat = None
+    _AGNO_IMPORT_ERROR = exc
+else:
+    _AGNO_IMPORT_ERROR = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,10 +209,23 @@ class QAResult:
     f1: float = 0.0
     bleu: float = 0.0
     llm_score: float = 0.0
+    rouge_1: float = 0.0
+    rouge_2: float = 0.0
+    rouge_l: float = 0.0
+    accuracy: float = 0.0
+    correct: bool = False
+    question_type: str = ""
+    question_date: str = ""
+    is_abstention: bool = False
+    latency_ms: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
     llm_calls: int = 0
+    status: str = "completed"
+    error: str = ""
+    memory_only_compliant: bool = True
+    context_leak_violations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -209,6 +237,16 @@ class TokenUsage:
 
 
 @dataclass
+class MemoryBuildReport:
+    method: str
+    backend: str
+    status: str = "not_started"
+    sessions_ingested: int = 0
+    turns_ingested: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SampleResult:
     sample_id: str
     qa_results: list[QAResult] = field(default_factory=list)
@@ -217,6 +255,7 @@ class SampleResult:
     overall_llm: float = 0.0
     total_time_ms: int = 0
     token_usage: TokenUsage | None = None
+    memory_build: MemoryBuildReport | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +287,213 @@ def call_openai(
         llm_calls=1,
     )
     return text, usage
+
+
+def _apply_lme_metrics(
+    qa_result: QAResult,
+    qa: object,
+    prediction: str,
+    eval_client: OpenAI | None,
+    eval_model: str,
+) -> TokenUsage:
+    qa_result.rouge_1 = lme_common.compute_rouge_n(prediction, qa.answer, 1)
+    qa_result.rouge_2 = lme_common.compute_rouge_n(prediction, qa.answer, 2)
+    qa_result.rouge_l = lme_common.compute_rouge_l(prediction, qa.answer)
+    if eval_client is None:
+        return TokenUsage()
+    judge_prompt = lme_common.build_longmemeval_judge_prompt(qa, prediction)
+    judge_resp, usage = call_openai(
+        eval_client, eval_model, judge_prompt, max_tokens=16,
+    )
+    correct = lme_common.parse_longmemeval_judge_label(judge_resp)
+    qa_result.correct = correct
+    qa_result.accuracy = 1.0 if correct else 0.0
+    qa_result.llm_score = qa_result.accuracy
+    return usage
+
+
+def _to_lme_case(sample: object, qa_result: QAResult) -> dict:
+    return {
+        "question_id": qa_result.question_id,
+        "question_type": qa_result.question_type or qa_result.category,
+        "question": qa_result.question,
+        "question_date": qa_result.question_date,
+        "expected": qa_result.reference,
+        "predicted": qa_result.prediction,
+        "is_abstention": qa_result.is_abstention,
+        "correct": qa_result.correct,
+        "metrics": {
+            "f1": qa_result.f1,
+            "bleu": qa_result.bleu,
+            "rouge_1": qa_result.rouge_1,
+            "rouge_2": qa_result.rouge_2,
+            "rouge_l": qa_result.rouge_l,
+            "accuracy": qa_result.accuracy,
+        },
+        "latency_ms": qa_result.latency_ms,
+        "token_usage": {
+            "prompt_tokens": qa_result.prompt_tokens,
+            "completion_tokens": qa_result.completion_tokens,
+            "total_tokens": qa_result.total_tokens,
+            "llm_calls": qa_result.llm_calls,
+        },
+        "retry_count": 0,
+        "total_turns": lme_common.total_turns(sample),
+        "total_sessions": len(getattr(sample, "conversation", []) or []),
+        "status": qa_result.status,
+        "error": qa_result.error,
+        "memory_only_compliant": qa_result.memory_only_compliant,
+        "context_leak_violations": qa_result.context_leak_violations,
+    }
+
+
+def _failed_qa_result(
+    qa: object,
+    error: str,
+    memory_only_compliant: bool = True,
+    context_leak_violations: list[str] | None = None,
+) -> QAResult:
+    return QAResult(
+        question_id=qa.question_id,
+        category=qa.category,
+        question=qa.question,
+        reference=qa.answer,
+        prediction="",
+        question_type=getattr(qa, "question_type", "") or qa.category,
+        question_date=getattr(qa, "question_date", ""),
+        is_abstention=bool(getattr(qa, "is_abstention", False)),
+        status="failed",
+        error=error,
+        memory_only_compliant=memory_only_compliant,
+        context_leak_violations=context_leak_violations or [],
+    )
+
+
+def _memory_build_metadata(
+    sample_results: list[SampleResult],
+    method: str,
+    backend: str,
+) -> dict:
+    reports = [sr.memory_build for sr in sample_results if sr.memory_build]
+    failed = [
+        sr.sample_id for sr in sample_results
+        if sr.memory_build and sr.memory_build.status != "completed"
+    ]
+    return {
+        "method": method,
+        "backend": backend,
+        "status": "failed" if failed else "completed",
+        "sample_count": len(sample_results),
+        "failed_samples": failed,
+        "total_sessions_ingested": sum(
+            report.sessions_ingested for report in reports
+        ),
+        "total_turns_ingested": sum(
+            report.turns_ingested for report in reports
+        ),
+        "per_sample": {
+            sr.sample_id: asdict(sr.memory_build)
+            for sr in sample_results if sr.memory_build
+        },
+    }
+
+
+def aggregate_longmemeval_results(
+    sample_results: list[SampleResult],
+    samples: list[object],
+    scenario: str,
+    model: str,
+    eval_model: str,
+    enable_llm_judge: bool,
+    args: argparse.Namespace,
+    total_time_ms: int,
+) -> dict:
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    cases: list[dict] = []
+    failed_cases = 0
+    for sr in sample_results:
+        sample = sample_by_id.get(sr.sample_id)
+        if sample is None:
+            continue
+        for qa in sr.qa_results:
+            case = _to_lme_case(sample, qa)
+            cases.append(case)
+            if case.get("status") != "completed":
+                failed_cases += 1
+    summary, by_type = lme_common.aggregate_longmemeval_cases(cases)
+    summary["total_cases"] = len(samples)
+    summary["completed_cases"] = len(cases)
+    summary["failed_cases"] = failed_cases
+    summary["successful_cases"] = len(cases) - failed_cases
+    summary["total_time_ms"] = total_time_ms
+    native_memory = scenario == "native_memory"
+    compliance = lme_common.memory_only_compliance_status(
+        cases,
+        native_memory,
+    )
+    memory_build_method = (
+        "Agno MemoryManager.create_user_memories with SqliteDb"
+        if native_memory else "none"
+    )
+    memory_backend = "sqlite" if native_memory else "none"
+    return {
+        "metadata": {
+            "framework": "agno-python",
+            "version": "agno-native-memory-only",
+            "dataset_format": "longmemeval",
+            "model": model,
+            "eval_model": eval_model,
+            "scenario": scenario,
+            "memory_backend": memory_backend,
+            "llm_judge": enable_llm_judge,
+            "memory_only_compliant": compliance["memory_only_compliant"],
+            "native_memory_preserved": compliance["native_memory_preserved"],
+            "fairly_comparable": compliance["fairly_comparable"],
+            "comparison_status": compliance["status"],
+            "comparison_blockers": compliance["reasons"],
+            "memory_build_method": memory_build_method,
+            "memory_build": _memory_build_metadata(
+                sample_results,
+                memory_build_method,
+                memory_backend,
+            ) if native_memory else {
+                "method": "none",
+                "backend": "none",
+                "status": "not_applicable",
+            },
+            "memory_only_policy": lme_common.memory_only_policy_metadata(
+                "agno-python",
+                "Agno add_memories_to_context output",
+                "fresh Agent run per question",
+            ) if native_memory else {
+                "enabled": False,
+                "reason": "full_context_baseline",
+            },
+            "memory_only_summary": compliance["summary"],
+            "qa_context_policy": (
+                "fresh Agent runs with only current question and "
+                "Agno add_memories_to_context output"
+                if native_memory else "full_context_baseline"
+            ),
+            "config": {
+                "dataset_path": str(
+                    lme_common.dataset_path(args.dataset, args.data_file)
+                ),
+                "manifest_path": args.manifest,
+                "question_types": lme_common.parse_question_types(
+                    args.question_types
+                ),
+                "expected_case_ids": lme_common.parse_question_types(
+                    args.expected_case_ids
+                ),
+                "max_tasks": args.max_tasks,
+            },
+            "sample_set": lme_common.sample_set_metadata(samples),
+        },
+        "summary": summary,
+        "by_type": by_type,
+        "cases": cases,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +583,7 @@ def evaluate_baseline(
 def _ingest_memories_for_sample(
     sample: dataset.LoCoMoSample,
     memory_manager: MemoryManager,
+    build_report: MemoryBuildReport,
 ) -> TokenUsage:
     """Feed each conversation turn to the MemoryManager so it
     extracts and stores facts into the database.
@@ -347,7 +594,9 @@ def _ingest_memories_for_sample(
 
     ingestion_usage = TokenUsage()
 
+    build_report.status = "in_progress"
     for sess in sample.conversation:
+        session_turns = 0
         for turn in sess.turns:
             text = (
                 f"[SessionDate: {sess.session_date}] "
@@ -360,11 +609,14 @@ def _ingest_memories_for_sample(
                     user_id=_MEMORY_USER_ID,
                     run_metrics=run_metrics,
                 )
+                build_report.turns_ingested += 1
+                session_turns += 1
             except Exception as e:
+                msg = f"session {sess.session_id}: {e}"
+                build_report.errors.append(msg)
                 log.warning(
-                    "Memory ingestion error for "
-                    "session %s: %s",
-                    sess.session_id, e,
+                    "Memory ingestion error for %s",
+                    msg,
                 )
 
             # Accumulate ingestion token usage.
@@ -384,7 +636,12 @@ def _ingest_memories_for_sample(
                 ) or 0
             )
             ingestion_usage.llm_calls += 1
+        if session_turns == len(sess.turns):
+            build_report.sessions_ingested += 1
 
+    build_report.status = (
+        "completed" if not build_report.errors else "failed"
+    )
     return ingestion_usage
 
 
@@ -394,6 +651,7 @@ def evaluate_memory(
     eval_client: OpenAI | None,
     eval_model: str,
     enable_llm_judge: bool,
+    longmemeval: bool = False,
 ) -> SampleResult:
     """Evaluate using Agno Memory (MemoryManager + SqliteDb).
 
@@ -426,47 +684,82 @@ def evaluate_memory(
             _MEMORY_CAPTURE_INSTRUCTIONS
         ),
     )
+    build_report = MemoryBuildReport(
+        method="Agno MemoryManager.create_user_memories with SqliteDb",
+        backend="sqlite",
+        status="in_progress",
+    )
 
     # Phase 1: Ingest conversation into memories.
     log.info("  Ingesting conversations into memory...")
     ingestion_usage = _ingest_memories_for_sample(
-        sample, memory_manager,
+        sample, memory_manager, build_report,
     )
     log.info(
         "  Ingestion done: %d LLM calls, %d tokens",
         ingestion_usage.llm_calls,
         ingestion_usage.total_tokens,
     )
+    if build_report.status != "completed":
+        error = "Agno native memory build failed: " + "; ".join(
+            build_report.errors
+        )
+        try:
+            shutil.rmtree(db_dir)
+        except Exception:
+            pass
+        return SampleResult(
+            sample_id=sample.sample_id,
+            qa_results=[_failed_qa_result(qa, error) for qa in sample.qa],
+            token_usage=TokenUsage(),
+            memory_build=build_report,
+        )
 
     # Phase 2: QA using Agent with stored memories.
     qa_results: list[QAResult] = []
     # Only track QA inference tokens (exclude ingestion).
     total_usage = TokenUsage()
 
-    qa_agent = Agent(
-        model=OpenAIChat(
-            id=model_name,
-            temperature=0.0,
-            max_tokens=500,
-        ),
-        db=sqlite_db,
-        add_memories_to_context=True,
-        # Do not create new memories from questions.
-        update_memory_on_run=False,
-        instructions=[
-            _QA_INSTRUCTIONS.format(
-                not_available=NOT_AVAILABLE,
-            ),
-        ],
-        markdown=False,
-    )
-
     for qa in sample.qa:
+        qa_agent = Agent(
+            model=OpenAIChat(
+                id=model_name,
+                temperature=0.0,
+                max_tokens=500,
+            ),
+            db=sqlite_db,
+            add_memories_to_context=True,
+            # Do not create new memories from questions.
+            update_memory_on_run=False,
+            instructions=[
+                _QA_INSTRUCTIONS.format(
+                    not_available=NOT_AVAILABLE,
+                ),
+            ],
+            markdown=False,
+        )
+        question_text = (
+            lme_common.build_memory_only_question(qa)
+            if longmemeval else qa.question
+        )
+        violations = lme_common.detect_direct_context_leaks(
+            sample,
+            {
+                "qa_user_message": question_text,
+                "qa_agent_instructions": "\n".join(
+                    _QA_INSTRUCTIONS.format(
+                        not_available=NOT_AVAILABLE,
+                    ).splitlines()
+                ),
+            },
+        )
         prediction = ""
         qa_usage = TokenUsage()
+        error = ""
+        qa_start = time.time()
         try:
             response = qa_agent.run(
-                input=qa.question,
+                input=question_text,
                 user_id=_MEMORY_USER_ID,
                 stream=False,
             )
@@ -495,6 +788,7 @@ def evaluate_memory(
                 qa.question_id, e,
             )
             prediction = ""
+            error = str(e)
 
         # Accumulate only QA inference tokens.
         total_usage.prompt_tokens += (
@@ -512,7 +806,41 @@ def evaluate_memory(
         bleu = metrics.compute_bleu1(prediction, qa.answer)
 
         llm_score = 0.0
-        if enable_llm_judge and eval_client:
+        judge_usage = TokenUsage()
+        correct = False
+        accuracy = 0.0
+        rouge_1 = 0.0
+        rouge_2 = 0.0
+        rouge_l = 0.0
+        if longmemeval:
+            tmp = QAResult(
+                question_id=qa.question_id,
+                category=qa.category,
+                question=qa.question,
+                reference=qa.answer,
+                prediction=prediction,
+            )
+            try:
+                judge_usage = _apply_lme_metrics(
+                    tmp,
+                    qa,
+                    prediction,
+                    eval_client if enable_llm_judge else None,
+                    eval_model,
+                )
+                correct = tmp.correct
+                accuracy = tmp.accuracy
+                llm_score = tmp.llm_score
+                rouge_1 = tmp.rouge_1
+                rouge_2 = tmp.rouge_2
+                rouge_l = tmp.rouge_l
+            except Exception as e:
+                error = str(e)
+                log.warning(
+                    "LongMemEval judge error for QA %s: %s",
+                    qa.question_id, e,
+                )
+        elif enable_llm_judge and eval_client:
             judge_prompt = metrics.build_llm_judge_prompt(
                 qa.question, qa.answer, prediction,
             )
@@ -523,6 +851,14 @@ def evaluate_memory(
             llm_score = metrics.parse_llm_judge_response(
                 judge_resp,
             )
+        qa_usage.prompt_tokens += judge_usage.prompt_tokens
+        qa_usage.completion_tokens += judge_usage.completion_tokens
+        qa_usage.total_tokens += judge_usage.total_tokens
+        qa_usage.llm_calls += judge_usage.llm_calls
+        total_usage.prompt_tokens += judge_usage.prompt_tokens
+        total_usage.completion_tokens += judge_usage.completion_tokens
+        total_usage.total_tokens += judge_usage.total_tokens
+        total_usage.llm_calls += judge_usage.llm_calls
 
         # Truncate prediction for logging; flag suspicious
         # outputs (system prompt leakage, too long, etc.).
@@ -546,6 +882,8 @@ def evaluate_memory(
         log.info(
             "      ref:  %s", qa.answer[:120],
         )
+        if violations:
+            error = lme_common.memory_only_failure_reason(violations)
         qa_results.append(QAResult(
             question_id=qa.question_id,
             category=qa.category,
@@ -555,10 +893,23 @@ def evaluate_memory(
             f1=m.f1,
             bleu=bleu,
             llm_score=llm_score,
+            rouge_1=rouge_1,
+            rouge_2=rouge_2,
+            rouge_l=rouge_l,
+            accuracy=accuracy,
+            correct=correct,
+            question_type=getattr(qa, "question_type", "") or qa.category,
+            question_date=getattr(qa, "question_date", ""),
+            is_abstention=bool(getattr(qa, "is_abstention", False)),
+            latency_ms=int((time.time() - qa_start) * 1000),
             prompt_tokens=qa_usage.prompt_tokens,
             completion_tokens=qa_usage.completion_tokens,
             total_tokens=qa_usage.total_tokens,
             llm_calls=qa_usage.llm_calls,
+            status="failed" if error else "completed",
+            error=error,
+            memory_only_compliant=not violations,
+            context_leak_violations=violations,
         ))
 
     # Clean up per-sample DB.
@@ -571,6 +922,7 @@ def evaluate_memory(
         sample_id=sample.sample_id,
         qa_results=qa_results,
         token_usage=total_usage,
+        memory_build=build_report,
     )
 
 
@@ -766,10 +1118,37 @@ def parse_args() -> argparse.Namespace:
         help="Output directory",
     )
     parser.add_argument(
+        "--dataset-format",
+        default="locomo",
+        choices=("locomo", "longmemeval"),
+        help="Dataset format to evaluate",
+    )
+    parser.add_argument(
         "--scenario", default="baseline",
         help=(
             "Evaluation scenario (comma-separated): "
-            "baseline, memory, all"
+            "baseline, memory, native_memory, all"
+        ),
+    )
+    parser.add_argument(
+        "--question-types",
+        default="",
+        help=(
+            "LongMemEval question types to include "
+            "(comma-separated, empty=all)"
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        default="",
+        help="Optional LongMemEval manifest JSON with case_ids",
+    )
+    parser.add_argument(
+        "--expected-case-ids",
+        default="",
+        help=(
+            "Comma-separated LongMemEval case ids expected after "
+            "filtering; order must match"
         ),
     )
     parser.add_argument(
@@ -808,21 +1187,43 @@ def get_eval_model_name(
     return env if env else model
 
 
-def get_scenarios(scenario_str: str) -> list[str]:
+def get_scenarios(
+    scenario_str: str,
+    dataset_format: str = "locomo",
+) -> list[str]:
     if scenario_str == "all":
+        if dataset_format == "longmemeval":
+            return ["native_memory"]
         return ["baseline", "memory"]
     result: list[str] = []
     seen: set[str] = set()
-    valid = {"baseline", "memory"}
+    valid = {"baseline", "memory", "native_memory"}
     for s in scenario_str.split(","):
         s = s.strip()
         if s not in valid:
             log.error("Invalid scenario: %s", s)
             sys.exit(1)
+        if dataset_format == "longmemeval" and s == "memory":
+            s = "native_memory"
         if s not in seen:
             seen.add(s)
             result.append(s)
     return result
+
+
+def _preflight(args: argparse.Namespace, model_name: str, eval_model_name: str) -> dict[str, str]:
+    if _AGNO_IMPORT_ERROR is not None:
+        raise ImportError(
+            "Agno dependencies are required for Agno evaluation"
+        ) from _AGNO_IMPORT_ERROR
+    return lme_common.preflight_common(
+        args.dataset,
+        args.data_file,
+        args.output,
+        model_name,
+        eval_model_name,
+        required_modules=["agno", "openai"],
+    )
 
 
 def main() -> None:
@@ -845,12 +1246,13 @@ def main() -> None:
         eval_model_name = get_eval_model_name(
             args, model_name,
         )
-        output_dir = args.output
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        preflight = _preflight(args, model_name, eval_model_name)
+        output_dir = preflight["output_dir"]
 
         log.info(
             "=== Agno Python Memory Evaluation "
-            "(LoCoMo) ==="
+            "(%s) ===",
+            args.dataset_format,
         )
         log.info("Model: %s", model_name)
         log.info("Eval Model: %s", eval_model_name)
@@ -859,9 +1261,20 @@ def main() -> None:
         log.info("Output: %s", output_dir)
 
         # Load dataset.
-        samples = dataset.load_samples(
-            args.dataset, args.data_file,
+        question_types = lme_common.parse_question_types(
+            args.question_types
         )
+        if args.dataset_format == "longmemeval":
+            samples = lme_common.load_longmemeval_samples(
+                args.dataset,
+                args.data_file,
+                question_types=question_types,
+                manifest_path=args.manifest or None,
+            )
+        else:
+            samples = dataset.load_samples(
+                args.dataset, args.data_file,
+            )
         log.info("Loaded %d samples", len(samples))
 
         # Filter.
@@ -880,14 +1293,28 @@ def main() -> None:
         if args.max_tasks > 0:
             samples = samples[: args.max_tasks]
             log.info("Limited to %d samples", len(samples))
+        expected_case_ids = lme_common.parse_question_types(
+            args.expected_case_ids
+        )
+        if args.dataset_format == "longmemeval":
+            lme_common.validate_sample_set(
+                samples,
+                expected_case_ids or None,
+                question_types or None,
+            )
+        elif not samples:
+            log.error("No samples to evaluate")
+            sys.exit(1)
 
         # Prepare clients.
         openai_client = create_openai_client()
         eval_client = (
-            openai_client if args.llm_judge else None
+            openai_client
+            if args.llm_judge or args.dataset_format == "longmemeval"
+            else None
         )
 
-        scenarios = get_scenarios(args.scenario)
+        scenarios = get_scenarios(args.scenario, args.dataset_format)
 
         for scenario in scenarios:
             log.info("")
@@ -917,6 +1344,13 @@ def main() -> None:
                         eval_client, eval_model_name,
                         args.llm_judge,
                     )
+                elif scenario == "native_memory":
+                    sr = evaluate_memory(
+                        sample, model_name,
+                        eval_client, eval_model_name,
+                        True,
+                        longmemeval=True,
+                    )
                 else:
                     continue
 
@@ -941,15 +1375,26 @@ def main() -> None:
                 )
 
             # Aggregate and save.
-            result = aggregate_results(
-                sample_results, scenario,
-                model_name, eval_model_name,
-                args.llm_judge,
-            )
             total_time = time.time() - start_time
-            result["summary"]["total_time_ms"] = int(
-                total_time * 1000
-            )
+            total_time_ms = int(total_time * 1000)
+            if args.dataset_format == "longmemeval":
+                result = aggregate_longmemeval_results(
+                    sample_results,
+                    samples,
+                    scenario,
+                    model_name,
+                    eval_model_name,
+                    True,
+                    args,
+                    total_time_ms,
+                )
+            else:
+                result = aggregate_results(
+                    sample_results, scenario,
+                    model_name, eval_model_name,
+                    args.llm_judge,
+                )
+                result["summary"]["total_time_ms"] = total_time_ms
 
             # Save JSON.
             scenario_dir = Path(output_dir) / scenario
@@ -974,4 +1419,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (EnvironmentError, FileNotFoundError, ImportError, OSError, ValueError) as exc:
+        log.error("Initialization failed: %s", exc)
+        sys.exit(2)

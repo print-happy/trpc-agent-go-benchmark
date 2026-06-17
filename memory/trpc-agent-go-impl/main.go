@@ -70,7 +70,8 @@ var (
 		"scenario",
 		"long_context",
 		"Evaluation scenario (comma-separated): "+
-			"long_context, session_recall, agentic, auto, graph_baseline, graph_mr, all",
+			"long_context, session_recall, agentic, auto, graph_baseline, graph_mr, all "+
+			"(LongMemEval supports long_context, auto, all; all runs auto and reports reuse existing long_context)",
 	)
 	// Memory backend flags (comma-separated for multiple).
 	flagMemoryBackends = flag.String(

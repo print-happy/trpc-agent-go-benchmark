@@ -426,20 +426,14 @@ func loadLMEInstances(cfg lmeRunConfig) ([]*dataset.LongMemEvalInstance, error) 
 
 func getLMEScenarios(raw string) []scenarios.ScenarioType {
 	if raw == "all" {
-		return []scenarios.ScenarioType{
-			scenarios.ScenarioLongContext,
-			scenarios.ScenarioSessionRecall,
-			scenarios.ScenarioAuto,
-			scenarios.ScenarioGraphBaseline,
-			scenarios.ScenarioGraphMR,
-		}
+		// The LongMemEval main memory run is auto. Reports reuse an
+		// existing long_context result as the reference baseline when
+		// present, so all must not rerun long_context.
+		return []scenarios.ScenarioType{scenarios.ScenarioAuto}
 	}
 	allowed := map[string]scenarios.ScenarioType{
-		"long_context":   scenarios.ScenarioLongContext,
-		"session_recall": scenarios.ScenarioSessionRecall,
-		"auto":           scenarios.ScenarioAuto,
-		"graph_baseline": scenarios.ScenarioGraphBaseline,
-		"graph_mr":       scenarios.ScenarioGraphMR,
+		"long_context": scenarios.ScenarioLongContext,
+		"auto":         scenarios.ScenarioAuto,
 	}
 	seen := make(map[string]struct{})
 	var out []scenarios.ScenarioType
@@ -450,7 +444,7 @@ func getLMEScenarios(raw string) []scenarios.ScenarioType {
 		}
 		scenarioType, ok := allowed[part]
 		if !ok {
-			log.Fatalf("LongMemEval supports only long_context, session_recall, auto, graph_baseline, graph_mr; got %s", part)
+			log.Fatalf("LongMemEval main report supports only long_context, auto, all; got %s", part)
 		}
 		if _, ok := seen[part]; ok {
 			continue
@@ -2259,8 +2253,26 @@ func writeLMEReports(
 	cfg lmeRunConfig,
 	scenarioTypes []scenarios.ScenarioType,
 ) error {
-	results := make([]*lmeRunResult, 0, len(scenarioTypes))
+	results := make([]*lmeRunResult, 0, len(scenarioTypes)+1)
+	seen := make(map[scenarios.ScenarioType]struct{}, len(scenarioTypes))
+	if !lmeScenarioSelected(scenarioTypes, scenarios.ScenarioLongContext) {
+		path := filepath.Join(
+			lmeScenarioDir(rootDir, scenarios.ScenarioLongContext, ""),
+			"results.json",
+		)
+		if _, err := os.Stat(path); err == nil {
+			result, err := readLMERunResult(path)
+			if err != nil {
+				return err
+			}
+			results = append(results, result)
+			seen[scenarios.ScenarioLongContext] = struct{}{}
+		}
+	}
 	for _, scenarioType := range scenarioTypes {
+		if _, ok := seen[scenarioType]; ok {
+			continue
+		}
 		backend := ""
 		if scenarioType == scenarios.ScenarioSessionRecall {
 			backend = "session_pgvector"
@@ -2275,15 +2287,11 @@ func writeLMEReports(
 			backend = lmeGraphMRBackendName(cfg.GraphMRMemoryBackend)
 		}
 		path := filepath.Join(lmeScenarioDir(rootDir, scenarioType, backend), "results.json")
-		data, err := os.ReadFile(path)
+		result, err := readLMERunResult(path)
 		if err != nil {
-			return fmt.Errorf("read result %s: %w", path, err)
+			return err
 		}
-		var result lmeRunResult
-		if err := json.Unmarshal(data, &result); err != nil {
-			return fmt.Errorf("parse result %s: %w", path, err)
-		}
-		results = append(results, &result)
+		results = append(results, result)
 	}
 	en := renderLMEReport(results, cfg, false)
 	zh := renderLMEReport(results, cfg, true)
@@ -2294,6 +2302,30 @@ func writeLMEReports(
 		return err
 	}
 	return nil
+}
+
+func lmeScenarioSelected(
+	scenarioTypes []scenarios.ScenarioType,
+	target scenarios.ScenarioType,
+) bool {
+	for _, scenarioType := range scenarioTypes {
+		if scenarioType == target {
+			return true
+		}
+	}
+	return false
+}
+
+func readLMERunResult(path string) (*lmeRunResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read result %s: %w", path, err)
+	}
+	var result lmeRunResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("parse result %s: %w", path, err)
+	}
+	return &result, nil
 }
 
 func renderLMEReport(results []*lmeRunResult, cfg lmeRunConfig, zh bool) string {
