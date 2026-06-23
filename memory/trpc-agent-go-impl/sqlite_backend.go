@@ -107,7 +107,11 @@ func createSQLiteVecService(
 	db.SetMaxIdleConns(defaultSQLiteMaxConn)
 
 	embedModelName := getEmbedModelName()
-	emb := newEmbeddingEmbedder(embedModelName)
+	emb, err := newEmbeddingEmbedder(embedModelName)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	svcOpts := []memorysqlitevec.ServiceOpt{
 		memorysqlitevec.WithTableName(tableName),

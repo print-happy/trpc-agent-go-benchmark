@@ -10,6 +10,40 @@ Based on:
 - [LoCoMo: Long-Context Conversational Memory](https://arxiv.org/abs/2402.17753)
 - [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564)
 
+## LongMemEval
+
+The LongMemEval benchmark compares the trpc-agent-go auto memory flow with
+the native memory implementations from ADK and Agno. Use one shared manifest
+so every implementation evaluates the same cases in the same order.
+
+```bash
+cd memory/trpc-agent-go-impl
+go run ./cmd/longmemeval-manifest \
+  -dataset ../data/longmemeval_s_cleaned.json \
+  -types single-session-user \
+  -per-type 70 \
+  -output ../results/longmemeval/manifests/single_session_user_70.json
+
+go run . \
+  -dataset-format longmemeval \
+  -dataset ../data/longmemeval_s_cleaned.json \
+  -scenario auto \
+  -lme-manifest ../results/longmemeval/manifests/single_session_user_70.json \
+  -output ../results
+```
+
+The ADK and Agno runners accept the same dataset, manifest, model, and output
+root. Their result files can be rendered with:
+
+```bash
+cd memory
+python longmemeval_report.py --root results/longmemeval
+```
+
+Provider-reported LLM and embedding calls and token usage are recorded by
+phase when available. Unknown provider token usage is marked explicitly
+rather than estimated with an extra tokenizer or API call.
+
 ## Reports
 
 | File | Description |
