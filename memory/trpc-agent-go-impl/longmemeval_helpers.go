@@ -20,6 +20,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/memory/deepsearch"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -196,6 +197,165 @@ func (s *lmeNoAutoMemoryService) SearchMemories(
 	opts ...memory.SearchOption,
 ) ([]*memory.Entry, error) {
 	return s.inner.SearchMemories(ctx, userKey, query, opts...)
+}
+
+func (s *lmeNoAutoMemoryService) EnsureIndex(
+	ctx context.Context,
+	userKey memory.UserKey,
+) error {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return err
+	}
+	return deepSearchSvc.EnsureIndex(ctx, userKey)
+}
+
+func (s *lmeNoAutoMemoryService) IndexDocuments(
+	ctx context.Context,
+	req deepsearch.IndexRequest,
+) error {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return err
+	}
+	return deepSearchSvc.IndexDocuments(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) SearchCues(
+	ctx context.Context,
+	req deepsearch.CueSearchRequest,
+) (*deepsearch.CueSearchResult, error) {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.SearchCues(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) ExpandTags(
+	ctx context.Context,
+	req deepsearch.TagExpandRequest,
+) (*deepsearch.TagExpandResult, error) {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.ExpandTags(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) LoadContents(
+	ctx context.Context,
+	req deepsearch.ContentLoadRequest,
+) (*deepsearch.ContentLoadResult, error) {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.LoadContents(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) DeleteDocuments(
+	ctx context.Context,
+	req deepsearch.DeleteRequest,
+) error {
+	deepSearchSvc, err := s.deepSearchService()
+	if err != nil {
+		return err
+	}
+	return deepSearchSvc.DeleteDocuments(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) EdgesByTag(
+	ctx context.Context,
+	req deepsearch.EdgesByTagRequest,
+) (*deepsearch.EdgesByTagResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.EdgesByTag(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryConversationTime(
+	ctx context.Context,
+	req deepsearch.QueryConversationTimeRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryConversationTime(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryEventKeywords(
+	ctx context.Context,
+	req deepsearch.QueryEventKeywordsRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryEventKeywords(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryEventContext(
+	ctx context.Context,
+	req deepsearch.QueryEventContextRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryEventContext(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryPersonalInformation(
+	ctx context.Context,
+	req deepsearch.QueryPersonalInformationRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryPersonalInformation(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryPersonalAspect(
+	ctx context.Context,
+	req deepsearch.QueryPersonalAspectRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryPersonalAspect(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) QueryTopicEvents(
+	ctx context.Context,
+	req deepsearch.QueryTopicEventsRequest,
+) (*deepsearch.QueryResult, error) {
+	deepSearchSvc, err := s.deepSearchQueryService()
+	if err != nil {
+		return nil, err
+	}
+	return deepSearchSvc.QueryTopicEvents(ctx, req)
+}
+
+func (s *lmeNoAutoMemoryService) deepSearchService() (deepsearch.Service, error) {
+	deepSearchSvc, ok := s.inner.(deepsearch.Service)
+	if !ok || deepSearchSvc == nil {
+		return nil, fmt.Errorf("memory deepsearch service is not available")
+	}
+	return deepSearchSvc, nil
+}
+
+func (s *lmeNoAutoMemoryService) deepSearchQueryService() (deepsearch.QueryService, error) {
+	deepSearchSvc, ok := s.inner.(deepsearch.QueryService)
+	if !ok || deepSearchSvc == nil {
+		return nil, fmt.Errorf("memory deepsearch query service is not available")
+	}
+	return deepSearchSvc, nil
 }
 
 func (s *lmeNoAutoMemoryService) Tools() []tool.Tool {

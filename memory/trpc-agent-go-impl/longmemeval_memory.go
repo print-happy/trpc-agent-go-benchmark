@@ -228,13 +228,14 @@ type lmeSessionRecallEvaluator struct {
 }
 
 type lmeAutoEvaluator struct {
-	name      string
-	judgeLLM  model.Model
-	qaLLM     model.Model
-	extractor extractor.MemoryExtractor
-	mem       memory.Service
-	cfg       lmeRunConfig
-	cost      *lmeCostTracker
+	name       string
+	judgeLLM   model.Model
+	qaLLM      model.Model
+	extractor  extractor.MemoryExtractor
+	mem        memory.Service
+	cfg        lmeRunConfig
+	cost       *lmeCostTracker
+	deepSearch bool
 }
 
 type lmeNoAutoMemoryService struct {
@@ -285,7 +286,8 @@ func runLongMemEvalMemory(ctx context.Context) error {
 func validateLMEPrerequisites(scenarioTypes []scenarios.ScenarioType) error {
 	for _, scenarioType := range scenarioTypes {
 		if scenarioType != scenarios.ScenarioSessionRecall &&
-			scenarioType != scenarios.ScenarioAuto {
+			scenarioType != scenarios.ScenarioAuto &&
+			scenarioType != scenarios.ScenarioAutoDeepSearch {
 			continue
 		}
 		if getPGVectorDSN() == "" {
@@ -418,8 +420,9 @@ func getLMEScenarios(raw string) []scenarios.ScenarioType {
 		return []scenarios.ScenarioType{scenarios.ScenarioAuto}
 	}
 	allowed := map[string]scenarios.ScenarioType{
-		"long_context": scenarios.ScenarioLongContext,
-		"auto":         scenarios.ScenarioAuto,
+		"long_context":    scenarios.ScenarioLongContext,
+		"auto":            scenarios.ScenarioAuto,
+		"auto_deepsearch": scenarios.ScenarioAutoDeepSearch,
 	}
 	seen := make(map[string]struct{})
 	var out []scenarios.ScenarioType
@@ -431,7 +434,7 @@ func getLMEScenarios(raw string) []scenarios.ScenarioType {
 		scenarioType, ok := allowed[part]
 		if !ok {
 			log.Fatalf(
-				"LongMemEval supports long_context, auto, all; got %s",
+				"LongMemEval supports long_context, auto, auto_deepsearch, all; got %s",
 				part,
 			)
 		}
@@ -465,7 +468,7 @@ func newLMEEvaluator(
 			return nil, "", err
 		}
 		return &lmeSessionRecallEvaluator{llm: llm, svc: svc, cfg: cfg}, "session_pgvector", nil
-	case scenarios.ScenarioAuto:
+	case scenarios.ScenarioAuto, scenarios.ScenarioAutoDeepSearch:
 		cost := newLMECostTracker()
 		memoryBuildLLM := newLMETrackedModel(
 			llm,
@@ -476,6 +479,12 @@ func newLMEEvaluator(
 		memOpts := memoryServiceOptions{
 			vectorTopK: cfg.SessionRecallResults,
 		}
+		deepSearch := scenarioType == scenarios.ScenarioAutoDeepSearch
+		if deepSearch {
+			cfg.AutoQAOnly = true
+			cfg.AutoMemoryTable = tableNameWithSuffix(pgvectorTableDefaultBase)
+			memOpts.deepSearchModel = memoryBuildLLM
+		}
 		memSvc, err := createMemoryService(
 			memCfg,
 			memOpts,
@@ -483,17 +492,22 @@ func newLMEEvaluator(
 		if err != nil {
 			return nil, "", err
 		}
+		name := "auto"
+		if deepSearch {
+			name = "auto_deepsearch"
+		}
 		return &lmeAutoEvaluator{
-			name:     "auto",
+			name:     name,
 			judgeLLM: newLMETrackedModel(llm, cost, lmeLLMPhaseJudge),
 			qaLLM:    newLMETrackedModel(llm, cost, lmeLLMPhaseQA),
 			extractor: extractor.NewExtractor(
 				memoryBuildLLM,
 				extractor.WithModelCallbacks(lmeExtractorModelCallbacks()),
 			),
-			mem:  memSvc,
-			cfg:  cfg,
-			cost: cost,
+			mem:        memSvc,
+			cfg:        cfg,
+			cost:       cost,
+			deepSearch: deepSearch,
 		}, "pgvector", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported LongMemEval scenario %s", scenarioType)
@@ -629,103 +643,6 @@ func setLMERunCost(
 		return
 	}
 	result.Cost = mergeLMECostReports(base, reporter.CostReport())
-}
-
-func setLMERunMetadata(result *lmeRunResult, evaluator lmeEvaluator) {
-	if result == nil || result.Metadata == nil {
-		return
-	}
-	name := evaluator.Name()
-	if name != "auto" {
-		return
-	}
-	method := "trpc-agent-go extractor.Extract -> pgvector memory.Service"
-	qaRuntime := "fresh in-memory QA session per question"
-	allowedInputs := []string{
-		"current_question",
-		"question_date",
-		"memory_search results",
-	}
-	forbiddenInputs := []string{
-		"full_conversation_transcript",
-		"full_session_transcript",
-		"longmemeval_haystack",
-		"gold_evidence",
-		"gold_answer_except_judge_prompt",
-	}
-	qaContextPolicy := "fresh QA sessions with only current question and memory_search results"
-	autoQAOnly := result.Metadata.Config.AutoQAOnly
-	if autoQAOnly {
-		method = fmt.Sprintf(
-			"%s from %s (QA only)",
-			method,
-			result.Metadata.Config.AutoMemoryTable,
-		)
-	}
-	totalSessions := 0
-	totalTurns := 0
-	failed := make([]string, 0)
-	for _, cr := range result.Cases {
-		if cr == nil {
-			continue
-		}
-		totalSessions += cr.TotalSessions
-		totalTurns += cr.TotalTurns
-	}
-	if result.Summary != nil &&
-		result.Summary.CompletedCases != result.Summary.TotalCases {
-		failed = append(failed, "incomplete_result")
-	}
-	comparable := len(failed) == 0
-	result.Metadata.MemoryOnlyCompliant = true
-	result.Metadata.NativeMemoryPreserved = true
-	result.Metadata.FairlyComparable = comparable
-	if comparable {
-		result.Metadata.ComparisonStatus = "comparable"
-	} else {
-		result.Metadata.ComparisonStatus = "not_comparable"
-	}
-	result.Metadata.ComparisonBlockers = failed
-	result.Metadata.MemoryBuildMethod = method
-	buildStatus := "completed"
-	buildCostIncluded := true
-	if autoQAOnly {
-		buildStatus = "reused"
-		buildCostIncluded = false
-		totalSessions = 0
-		totalTurns = 0
-	}
-	if !comparable {
-		buildStatus = "failed"
-	}
-	memoryBuild := map[string]any{
-		"method":                  result.Metadata.MemoryBuildMethod,
-		"backend":                 result.Metadata.MemoryBackend,
-		"status":                  buildStatus,
-		"cost_included":           buildCostIncluded,
-		"sample_count":            len(result.Cases),
-		"failed_samples":          failed,
-		"total_sessions_ingested": totalSessions,
-		"total_turns_ingested":    totalTurns,
-	}
-	if autoQAOnly {
-		memoryBuild["source_table"] = result.Metadata.Config.AutoMemoryTable
-	}
-	result.Metadata.MemoryBuild = memoryBuild
-	result.Metadata.MemoryOnlyPolicy = map[string]any{
-		"enabled":          true,
-		"framework":        "trpc-agent-go",
-		"qa_runtime":       qaRuntime,
-		"allowed_inputs":   allowedInputs,
-		"forbidden_inputs": forbiddenInputs,
-	}
-	result.Metadata.MemoryOnlySummary = map[string]any{
-		"compliant":     true,
-		"checked_cases": len(result.Cases),
-		"failed_cases":  []string{},
-		"violations":    map[string][]string{},
-	}
-	result.Metadata.QAContextPolicy = qaContextPolicy
 }
 
 func aggregateLMERunResult(result *lmeRunResult, elapsed time.Duration, totalCases int) {

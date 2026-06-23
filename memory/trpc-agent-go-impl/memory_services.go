@@ -20,6 +20,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/memory/deepsearch"
 	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
 	"trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 	memorymysql "trpc.group/trpc-go/trpc-agent-go/memory/mysql"
@@ -163,6 +164,7 @@ func buildMemoryServiceOptions(
 type memoryServiceOptions struct {
 	enableExtractor bool
 	extractorModel  model.Model
+	deepSearchModel model.Model
 	vectorTopK      int
 }
 
@@ -252,6 +254,15 @@ func createPGVectorService(
 		memorypgvector.WithMaxResults(opts.vectorTopK),
 		memorypgvector.WithTableName(tableName),
 		memorypgvector.WithExtractor(ext),
+	}
+	if opts.deepSearchModel != nil {
+		svcOpts = append(
+			svcOpts,
+			memorypgvector.WithDeepSearch(
+				opts.deepSearchModel,
+				deepsearch.WithBatchSize(lmeDeepSearchBatchSize),
+			),
+		)
 	}
 	if opts.enableExtractor {
 		svcOpts = append(svcOpts,

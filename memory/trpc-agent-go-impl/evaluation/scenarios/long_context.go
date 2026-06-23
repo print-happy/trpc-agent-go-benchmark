@@ -27,10 +27,11 @@ type ScenarioType string
 
 // Scenario types.
 const (
-	ScenarioLongContext   ScenarioType = "long_context"
-	ScenarioSessionRecall ScenarioType = "session_recall"
-	ScenarioAgentic       ScenarioType = "agentic"
-	ScenarioAuto          ScenarioType = "auto"
+	ScenarioLongContext    ScenarioType = "long_context"
+	ScenarioSessionRecall  ScenarioType = "session_recall"
+	ScenarioAgentic        ScenarioType = "agentic"
+	ScenarioAuto           ScenarioType = "auto"
+	ScenarioAutoDeepSearch ScenarioType = "auto_deepsearch"
 )
 
 // Config holds scenario evaluation configuration.

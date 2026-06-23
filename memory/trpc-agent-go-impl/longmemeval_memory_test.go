@@ -13,9 +13,17 @@ import (
 	"context"
 	"testing"
 
+	"trpc.group/trpc-go/trpc-agent-go-benchmark/memory/trpc-agent-go-impl/evaluation/scenarios"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
 )
+
+func TestGetLMEScenariosAutoDeepSearch(t *testing.T) {
+	got := getLMEScenarios("auto_deepsearch")
+	if len(got) != 1 || got[0] != scenarios.ScenarioAutoDeepSearch {
+		t.Fatalf("getLMEScenarios(auto_deepsearch) = %v, want [%s]", got, scenarios.ScenarioAutoDeepSearch)
+	}
+}
 
 func TestRequireLMEAutoMemories(t *testing.T) {
 	ctx := context.Background()

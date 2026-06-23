@@ -62,8 +62,8 @@ var (
 		"scenario",
 		"long_context",
 		"Evaluation scenario (comma-separated): "+
-			"long_context, session_recall, agentic, auto, all "+
-			"(LongMemEval supports long_context, auto, all)",
+			"long_context, session_recall, agentic, auto, auto_deepsearch, all "+
+			"(LongMemEval supports long_context, auto, auto_deepsearch, all)",
 	)
 	// Memory backend flags (comma-separated for multiple).
 	flagMemoryBackends = flag.String(
@@ -164,6 +164,8 @@ const (
 	autoMemoryJobTimeout   = 2 * time.Minute
 
 	maxQASearchPasses = 3
+
+	lmeDeepSearchBatchSize = 40
 )
 
 // tableNameWithSuffix appends the user-specified suffix to a base table name.
@@ -409,10 +411,11 @@ func containsScenario(
 
 func getScenarios(scenario string) []scenarios.ScenarioType {
 	scenarioMap := map[string]scenarios.ScenarioType{
-		"long_context":   scenarios.ScenarioLongContext,
-		"session_recall": scenarios.ScenarioSessionRecall,
-		"agentic":        scenarios.ScenarioAgentic,
-		"auto":           scenarios.ScenarioAuto,
+		"long_context":    scenarios.ScenarioLongContext,
+		"session_recall":  scenarios.ScenarioSessionRecall,
+		"agentic":         scenarios.ScenarioAgentic,
+		"auto":            scenarios.ScenarioAuto,
+		"auto_deepsearch": scenarios.ScenarioAutoDeepSearch,
 	}
 	if scenario == "all" {
 		return []scenarios.ScenarioType{
@@ -564,16 +567,20 @@ func validateFlags() {
 	}
 
 	validScenarios := map[string]bool{
-		"long_context":   true,
-		"session_recall": true,
-		"agentic":        true,
-		"auto":           true,
-		"all":            true,
+		"long_context":    true,
+		"session_recall":  true,
+		"agentic":         true,
+		"auto":            true,
+		"auto_deepsearch": true,
+		"all":             true,
 	}
 	for _, s := range strings.Split(*flagScenario, ",") {
 		s = strings.TrimSpace(s)
 		if !validScenarios[s] {
 			log.Fatalf("Invalid scenario: %s", s)
+		}
+		if s == "auto_deepsearch" && *flagDatasetFormat != lmeDatasetFormat {
+			log.Fatalf("auto_deepsearch is only supported with dataset-format longmemeval")
 		}
 	}
 
@@ -594,8 +601,8 @@ func validateFlags() {
 			log.Fatalf("lme-auto-qa-only requires dataset-format longmemeval")
 		}
 		scenario := strings.TrimSpace(*flagScenario)
-		if scenario != "auto" {
-			log.Fatalf("lme-auto-qa-only requires scenario auto")
+		if scenario != "auto" && scenario != "auto_deepsearch" {
+			log.Fatalf("lme-auto-qa-only requires scenario auto or auto_deepsearch")
 		}
 		if len(parseMemoryBackends(*flagMemoryBackends)) != 1 ||
 			parseMemoryBackends(*flagMemoryBackends)[0] != "pgvector" {

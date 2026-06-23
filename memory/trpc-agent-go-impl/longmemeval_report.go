@@ -152,7 +152,8 @@ func writeLMEReports(
 		if scenarioType == scenarios.ScenarioSessionRecall {
 			backend = "session_pgvector"
 		}
-		if scenarioType == scenarios.ScenarioAuto {
+		if scenarioType == scenarios.ScenarioAuto ||
+			scenarioType == scenarios.ScenarioAutoDeepSearch {
 			backend = "pgvector"
 		}
 		path := filepath.Join(lmeScenarioDir(rootDir, scenarioType, backend), "results.json")

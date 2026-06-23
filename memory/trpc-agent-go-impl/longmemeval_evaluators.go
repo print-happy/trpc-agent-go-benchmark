@@ -24,7 +24,9 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
+	"trpc.group/trpc-go/trpc-agent-go/memory/deepsearch"
 	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
+	memorytool "trpc.group/trpc-go/trpc-agent-go/memory/tool"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	"trpc.group/trpc-go/trpc-agent-go/session"
@@ -295,6 +297,11 @@ func (e *lmeAutoEvaluator) Evaluate(
 			return nil, err
 		}
 	}
+	if e.deepSearch {
+		if err := clearLMEDeepSearchIndex(ctx, e.mem, userKey); err != nil {
+			return nil, err
+		}
+	}
 	qaMem := &lmeNoAutoMemoryService{inner: e.mem}
 	agent := e.newQAAgent(e.qaTools(qaMem))
 	qaRunner := runner.NewRunner(
@@ -319,6 +326,24 @@ func (e *lmeAutoEvaluator) Evaluate(
 		time.Since(start), &cr.Usage, cr.RetryCount,
 		nil, cr.Steps, lmeQAConversationTrace(e.cfg, msg, cr.Trace),
 	)
+}
+
+func clearLMEDeepSearchIndex(
+	ctx context.Context,
+	mem memory.Service,
+	userKey memory.UserKey,
+) error {
+	deepSearchSvc, ok := mem.(deepsearch.Service)
+	if !ok || deepSearchSvc == nil {
+		return fmt.Errorf("memory service does not implement deepsearch.Service")
+	}
+	if err := deepSearchSvc.DeleteDocuments(ctx, deepsearch.DeleteRequest{
+		UserKey:  userKey,
+		ClearAll: true,
+	}); err != nil {
+		return fmt.Errorf("clear deepsearch index: %w", err)
+	}
+	return nil
 }
 
 func requireLMEAutoMemories(
@@ -472,10 +497,28 @@ func (e *lmeAutoEvaluator) newQAAgent(tools []tool.Tool) agent.Agent {
 		}),
 		llmagent.WithMaxToolIterations(8),
 	}
+	if e.deepSearch {
+		options = append(options, llmagent.WithMemoryDeepSearch())
+	}
 	return llmagent.New(lmeQAAgentName, options...)
 }
 
 func (e *lmeAutoEvaluator) qaInstruction() string {
+	if e.deepSearch {
+		return `You are a memory retrieval assistant for LongMemEval.
+
+Required workflow:
+1. Call memory_search first with a short keyword query using names, entities, dates, and topics from the question.
+2. After memory_search returns, always call memory_deepsearch before the final answer.
+3. After memory_deepsearch activates additional tools, call at least one memory_deepsearch_* tool to gather or verify evidence.
+4. Use the original memory_search result and the DeepSearch result together.
+
+Rules:
+- Do not use kind filters.
+- Answer only from retrieved memories.
+- If all retrieved memories still do not contain enough information after DeepSearch, say that the information is not available.
+- Output the direct answer only.`
+	}
 	return `You are a memory retrieval assistant for LongMemEval.
 
 Rules:
@@ -488,6 +531,9 @@ Rules:
 }
 
 func (e *lmeAutoEvaluator) qaTools(mem memory.Service) []tool.Tool {
+	if e.deepSearch {
+		return []tool.Tool{memorytool.NewSearchTool()}
+	}
 	return mem.Tools()
 }
 
